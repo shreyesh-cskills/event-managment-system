@@ -2,7 +2,7 @@
    cancel, edit a session, waitlist). The create and edit form is in event-form.js. */
 (function () {
   'use strict';
-  const filters = { venue: '', status: '', format: '', q: '' };
+  const filters = { venue: '', status: '', format: '', q: '', type: '' };
   const S = () => App.state;
   const who = () => App.user().name;
   const esc = (v) => UI.esc(v);
@@ -20,6 +20,11 @@
   const sessionLabel = (x) => (x.start ? UI.dateTime(x.start) : 'No date yet');
   const peopleIn = (rows) => rows.reduce((n, r) => n + new Set(r.tickets.map((t) => t.personId)).size, 0);
   const waitlistFor = (sessionId) => S().waitlist.filter((w) => w.sessionId === sessionId && w.status !== 'Removed' && w.status !== 'Booked');
+  const isAdmin = () => App.role() === 'admin';
+  const statusBadge = (st) => UI.badge(st, st === 'Pending approval' ? 'warn' : undefined);
+  const approvalOf = (e) => (e.approval && e.approval.status) || '';
+  /* A rejected event goes back to marketing, even when it is a copy of a live event. */
+  const needsApproval = (e) => Core.needsEventApproval(S(), App.role(), e) || (App.role() === 'manager' && approvalOf(e) === 'rejected');
 
   /* ---------- List ---------- */
   function spacesText(e, now) {
@@ -47,13 +52,17 @@
       return a.k.group === 0 ? a.k.at.localeCompare(b.k.at) : b.k.at.localeCompare(a.k.at);
     }).map((x) => x.e);
   }
-  const showVenueFilter = () => Core.allVenues(App.user()) && !App.venueId();
-  function filtered(now) {
+  /* The admin, and staff who work at more than one club, can narrow the list to one venue. */
+  const filterVenues = () => S().venues.filter((v) => Core.canSeeVenue(App.user(), v.id));
+  const showVenueFilter = () => filterVenues().length > 1 && !App.venueId();
+  /* skip: leave one tab row out, so each tab can show how many events it would give. */
+  function filtered(now, skip) {
     const s = S(), q = filters.q.trim().toLowerCase();
     return App.visibleEvents().filter((e) => {
       if (showVenueFilter() && filters.venue && e.venueId !== filters.venue) return false;
-      if (filters.status && Core.eventStatus(s, e, now) !== filters.status) return false;
-      if (filters.format && e.format !== filters.format) return false;
+      if (filters.type && e.typeId !== filters.type) return false;
+      if (skip !== 'status' && filters.status && Core.eventStatus(s, e, now) !== filters.status) return false;
+      if (skip !== 'format' && filters.format && e.format !== filters.format) return false;
       if (q && ![e.title, venueName(e.venueId), typeName(e.typeId)].join(' ').toLowerCase().includes(q)) return false;
       return true;
     });
@@ -66,49 +75,96 @@
       if (rem.length) return esc(UI.dateTime(rem[0].start)) + (rem.length > 1 ? `<br><span class="hint">${esc(plural(rem.length, 'session'))} to go</span>` : '');
       return '<span class="muted">None to come</span>';
     };
-    box.innerHTML = `<p class="hint" role="status">${esc(plural(rows.length, 'event'))}</p>` + UI.table([
+    box.innerHTML = `<p class="hint" role="status">${esc(plural(rows.length, 'event'))}</p>` + UI.table({ title: 'All events', subtitle: 'Every event with its status, next session and bookings.' }, [
       { label: 'Event', html: (e) => `<a href="#/events/${encodeURIComponent(e.id)}"><b>${esc(e.title)}</b></a><br><span class="hint">${esc(typeName(e.typeId))}</span>` },
       { label: 'Venue', html: (e) => esc(venueName(e.venueId)) },
       { label: 'Format', html: (e) => esc(e.format) },
       { label: 'Next session', html: nextDate },
       { label: 'Spaces', html: (e) => spacesText(e, now) },
-      { label: 'Status', html: (e) => UI.badge(Core.eventStatus(s, e, now)) }
-    ], rows, { emptyText: 'No events match these filters.' });
+      { label: 'Status', html: (e) => statusBadge(Core.eventStatus(s, e, now)) + (e.draft && approvalOf(e) === 'rejected' ? '<br><span class="hint">Not approved</span>' : '') }
+    ], rows, { emptyText: 'No events match these filters.', tools: UI.search({ attrs: 'data-f="q"', value: filters.q, placeholder: 'Search event, venue or type...' }) + UI.filterButton('events', dialogCount()) });
   }
+  const dialogCount = () => [showVenueFilter() && filters.venue, filters.type].filter(Boolean).length;
+  const formatTabs = (now) => UI.tabs([{ icon: 'grid', key: '', label: 'All', count: filtered(now, 'format').length, on: !filters.format }]
+    .concat(Core.FORMATS.map((f) => ({ icon: { 'One-off': 'ticket', 'Seasonal series': 'cal', 'Regular series': 'repeat', Coaching: 'user' }[f] || 'cal', key: f, label: f, count: filtered(now, 'format').filter((e) => e.format === f).length, on: filters.format === f }))), { attr: 'data-format', label: 'Format' });
+  const statusTabs = (now) => {
+    const base = filtered(now, 'status').filter((e) => !filters.format || e.format === filters.format);
+    return UI.tabs([{ key: '', label: 'All', count: base.length, on: !filters.status }]
+      .concat(Core.STATUSES.map((st) => ({ key: st, label: st, count: base.filter((e) => Core.eventStatus(S(), e, now) === st).length, on: filters.status === st }))), { sub: true, attr: 'data-status', label: 'Status' });
+  };
+  /* The marketing admin's way in to new events from club managers. */
+  const approvalChip = () => {
+    if (!isAdmin()) return '';
+    const n = App.visibleEvents().filter((e) => !e.cancelled && approvalOf(e) === 'pending').length;
+    if (!n) return '';
+    return `<button type="button" class="ev-chip" data-approval aria-pressed="${filters.status === 'Pending approval'}">Waiting for approval <b>${n}</b></button>`;
+  };
+  const crumbs = () => UI.crumbs([{ label: 'Events Admin', href: App.home() }, { label: 'Events', href: '#/events' }]
+    .concat(filters.format ? [{ label: filters.format }] : []).concat(filters.status ? [{ label: filters.status }] : []));
   function renderList(main) {
-    const head = UI.pageHead('Events', App.can('events.edit') ? '<a class="btn btn-primary" href="#/events/new">New event</a>' : '', 'Create and manage events, sessions, prices, spaces and waitlists.');
-    const venues = [{ value: '', label: 'All venues' }].concat(S().venues.map((v) => ({ value: v.id, label: v.name })));
-    const opt = (list, label) => [{ value: '', label }].concat(list.map((x) => ({ value: x, label: x })));
-    main.innerHTML = `<div class="ev-page">${head}
-      <form class="filters ev-filters" id="ev-filters" role="search" onsubmit="return false">
-        ${showVenueFilter() ? `<label><span>Venue</span><select data-f="venue">${UI.options(venues, filters.venue)}</select></label>` : ''}
-        <label><span>Status</span><select data-f="status">${UI.options(opt(Core.STATUSES, 'All statuses'), filters.status)}</select></label>
-        <label><span>Format</span><select data-f="format">${UI.options(opt(Core.FORMATS, 'All formats'), filters.format)}</select></label>
-        <label class="ev-search"><span>Search</span><input type="search" data-f="q" value="${esc(filters.q)}" placeholder="Event, venue or type"></label>
-        <button type="button" class="btn btn-ghost" id="ev-clear">Clear filters</button>
-      </form>
+    const now = App.now(), visible = App.visibleEvents();
+    const stats = UI.statPill([{ n: visible.filter((e) => Core.eventStatus(S(), e, now) === 'On sale').length, label: 'On sale' }, { n: visible.filter((e) => Core.eventStatus(S(), e, now) === 'Draft').length, label: 'Draft' }]);
+    const head = UI.pageHead('Events', stats + (App.can('events.edit') ? '<a class="btn btn-primary" href="#/events/new">New event</a>' : ''), 'Create and manage events, sessions, prices, spaces and waitlists.');
+    main.innerHTML = `<div class="ev-page"><div id="ev-crumbs"></div>${head}
+      <div class="list-bar">
+        <div id="ev-approval"></div>
+        <div id="ev-formats"></div>
+        <div class="list-row">
+          <div id="ev-statuses"></div>
+        </div>
+      </div>
       <div id="ev-results"></div></div>`;
     const box = main.querySelector('#ev-results');
-    main.querySelectorAll('[data-f]').forEach((c) => c.addEventListener('input', () => { filters[c.dataset.f] = c.value; renderResults(box); }));
-    main.querySelector('#ev-clear').addEventListener('click', () => {
-      filters.venue = ''; filters.status = ''; filters.format = ''; filters.q = '';
-      App.render();
+    const paintBar = () => {
+      const t = App.now();
+      main.querySelector('#ev-crumbs').innerHTML = crumbs();
+      UI.keepFocus(() => { main.querySelector('#ev-approval').innerHTML = approvalChip(); main.querySelector('#ev-formats').innerHTML = formatTabs(t); main.querySelector('#ev-statuses').innerHTML = statusTabs(t); });
+      UI.setFilterCount(main, dialogCount());
+    };
+    const change = () => { paintBar(); UI.keepFocus(() => renderResults(box)); };
+    box.addEventListener('input', (ev) => { if (ev.target.matches('[data-f="q"]')) { filters.q = ev.target.value; change(); } });
+    main.querySelector('#ev-approval').addEventListener('click', (ev) => {
+      if (!ev.target.closest('[data-approval]')) return;
+      const on = filters.status === 'Pending approval';
+      filters.status = on ? '' : 'Pending approval';
+      if (!on) filters.format = '';
+      change();
     });
-    renderResults(box);
+    main.querySelector('#ev-formats').addEventListener('click', (ev) => { const b = ev.target.closest('[data-format]'); if (b) { filters.format = b.dataset.format; change(); } });
+    main.querySelector('#ev-statuses').addEventListener('click', (ev) => { const b = ev.target.closest('[data-status]'); if (b) { filters.status = b.dataset.status; change(); } });
+    UI.onFilter('events', () => UI.filterDialog({
+      title: 'Filter events',
+      fields: [].concat(showVenueFilter() ? [{ key: 'venue', label: 'Venue', any: 'All venues', options: filterVenues().map((v) => ({ value: v.id, label: v.name })) }] : [])
+        .concat([{ key: 'type', label: 'Event type', any: 'All types', options: (S().eventTypes || []).map((x) => ({ value: x.id, label: x.name })) }]),
+      values: filters,
+      onApply: (v) => { filters.venue = v.venue || ''; filters.type = v.type || ''; change(); }
+    }));
+    change();
   }
 
   /* ---------- Event page ---------- */
   function actionButtons(e, status, rem) {
     const out = [];
     if (App.can('events.edit')) {
-      if (e.draft) out.push('<button type="button" class="btn btn-primary" data-act="publish">Publish</button>');
+      const pending = approvalOf(e) === 'pending';
+      if (pending && isAdmin()) out.push('<button type="button" class="btn btn-primary" data-act="approve">Approve</button>', '<button type="button" class="btn btn-danger" data-act="reject">Reject</button>');
+      else if (e.draft && !pending) out.push(`<button type="button" class="btn btn-primary" data-act="publish">${needsApproval(e) ? 'Send for approval' : 'Publish'}</button>`);
       if (!e.cancelled) out.push(`<a class="btn" href="#/events/${encodeURIComponent(e.id)}/edit">Edit</a>`);
       out.push('<button type="button" class="btn" data-act="duplicate">Duplicate</button>');
+      if (!e.draft && !e.cancelled) out.push('<button type="button" class="btn" data-act="share">Share links</button>');
       if (status === 'On sale' || status === 'Sold out') out.push('<button type="button" class="btn" data-act="close-sales">Close sales</button>');
       if (status === 'Sales closed' && rem.length) out.push('<button type="button" class="btn" data-act="open-sales">Open sales again</button>');
     }
     if (App.can('events.cancel') && !e.draft && !e.cancelled && rem.length) out.push('<button type="button" class="btn btn-danger" data-act="cancel-event">Cancel event</button>');
     return out.join('');
+  }
+  function approvalNote(e) {
+    const a = e.approval;
+    if (!a || e.cancelled) return '';
+    const stamp = `${esc(a.by || 'Staff')}, ${esc(a.at ? UI.dateTime(a.at) : '')}`;
+    if (a.status === 'pending') return `<div class="ev-note"><b>Waiting for marketing approval.</b> Sent by ${stamp}. Customers cannot book this event until it is approved.</div>`;
+    if (a.status === 'rejected' && e.draft) return `<div class="ev-warn"><b>Marketing did not approve this event.</b> Reason: ${esc(a.reason)} <span class="hint">(${stamp})</span>${isAdmin() ? '' : '<br>Change what is needed, then send it for approval again.'}</div>`;
+    return '';
   }
   function detailsCard(e) {
     const guest = { lead: 'Lead booker only', name: 'A name for each guest', nameEmail: 'A name and email for each guest' }[e.guestDetails] || e.guestDetails;
@@ -185,10 +241,11 @@
       if (!x.cancelled && !e.draft && App.can('checkin')) bits.push(`<a class="btn btn-small" href="#/checkin/${encodeURIComponent(x.id)}" aria-label="Check-in for ${esc(label)}">Check-in</a>`);
       if (!x.cancelled && !e.draft && !e.cancelled && (e.waitlistOn || waitlistFor(x.id).length)) bits.push(`<button type="button" class="btn btn-small" data-act="waitlist" data-sid="${esc(x.id)}" aria-label="Waitlist for ${esc(label)}">Waitlist (${waitlistFor(x.id).length})</button>`);
       if (App.can('events.edit') && !x.cancelled && !e.cancelled && (!x.start || isFuture(x, now))) bits.push(`<button type="button" class="btn btn-small" data-act="edit-session" data-sid="${esc(x.id)}" aria-label="Edit ${esc(label)}">Edit</button>`);
+      if (App.can('events.edit') && !e.draft && !x.cancelled && !e.cancelled && isFuture(x, now)) bits.push(`<button type="button" class="btn btn-small" data-act="message" data-sid="${esc(x.id)}" aria-label="Message attendees of ${esc(label)}">Message</button>`);
       if (App.can('events.cancel') && !e.draft && !x.cancelled && !e.cancelled && isFuture(x, now)) bits.push(`<button type="button" class="btn btn-small" data-act="cancel-session" data-sid="${esc(x.id)}" aria-label="Cancel ${esc(label)}">Cancel</button>`);
       return `<div class="ev-actions">${bits.join('') || '<span class="muted">None</span>'}</div>`;
     } });
-    return `<section class="card ev-sessions"><h2>Sessions</h2>${blockNote(e, rem, now)}${UI.table(cols, list, { emptyText: 'No sessions yet.' })}</section>`;
+    return `<section class="card ev-sessions"><h2>Sessions</h2>${blockNote(e, rem, now)}${UI.table({ subtitle: 'Each session with its date, places and bookings.' }, cols, list, { emptyText: 'No sessions yet.' })}</section>`;
   }
   function renderDetail(main, id) {
     const s = S(), e = Core.findEvent(s, id), now = App.now();
@@ -199,8 +256,9 @@
     const status = Core.eventStatus(s, e, now), rem = e.cancelled ? [] : Core.remainingSessions(e, now);
     main.innerHTML = `<div class="ev-page" id="ev-detail">
       <p class="ev-back"><a href="#/events">Back to Events</a></p>
-      ${UI.pageHead(e.title, actionButtons(e, status, rem), `${venueName(e.venueId)} · ${e.format}. See this event's sessions and spaces, and manage or cancel them.`)}
-      <p>${UI.badge(status)}</p>
+      ${UI.pageHead(e.title, actionButtons(e, status, rem), `${venueName(e.venueId)} · ${e.format}. See this event's sessions and spaces, and manage or cancel them.`, '#/events')}
+      <p>${statusBadge(status)}</p>
+      ${approvalNote(e)}
       ${e.cancelled ? '<div class="ev-warn">This event is cancelled.</div>' : ''}
       ${sessionsCard(e, rem, now)}
       <div class="ev-columns">${detailsCard(e)}${priceCard(e)}</div></div>`;
@@ -209,13 +267,48 @@
       if (!b) return;
       const sid = b.dataset.sid, act = b.dataset.act;
       if (act === 'publish') publish(e);
+      else if (act === 'approve') approve(e);
+      else if (act === 'reject') reject(e);
+      else if (act === 'message') messageAttendees(e, sid);
       else if (act === 'duplicate') duplicate(e);
+      else if (act === 'share') shareLinks(e);
       else if (act === 'close-sales') closeSales(e);
       else if (act === 'open-sales') openSales(e);
       else if (act === 'cancel-event') startCancel(e, Core.remainingSessions(e, App.now()).map((x) => x.id), true);
       else if (act === 'cancel-session') startCancel(e, [sid], false);
       else if (act === 'edit-session') editSession(e, sid);
       else if (act === 'waitlist') openWaitlist(e, sid);
+    });
+  }
+
+  /* ---------- Share links: booking links tagged with where they are posted, so Reports can show the source ---------- */
+  const SHARE_SOURCES = [
+    { key: 'instagram', label: 'Instagram', medium: 'social' },
+    { key: 'email', label: 'Email newsletter', medium: 'email' },
+    { key: 'facebook', label: 'Facebook', medium: 'social' }
+  ];
+  const slug = (t) => String(t || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40) || 'event';
+  const shareUrl = (e, source, medium) => `${location.origin}${location.pathname}#/browse?event=${encodeURIComponent(e.id)}&utm_source=${encodeURIComponent(source)}&utm_medium=${encodeURIComponent(medium)}&utm_campaign=${encodeURIComponent(slug(e.title))}`;
+  function shareLinks(e) {
+    const row = (label, url, id) => `<div class="ev-share-row"><label class="field"><span>${esc(label)}</span><input type="text" readonly id="${id}" value="${esc(url)}"></label><button type="button" class="btn btn-small" data-copy="${id}" aria-label="Copy the ${esc(label)} link">Copy</button></div>`;
+    UI.dialog({
+      title: 'Share links', subtitle: 'Use a different link in each place you post, so Reports can show which one brought the bookings.', wide: true,
+      body: `<div class="ev-share">${SHARE_SOURCES.map((x) => row(x.label, shareUrl(e, x.key, x.medium), `ev-share-${x.key}`)).join('')}
+        <div class="ev-share-row"><label class="field"><span>Partner or other place</span><input type="text" id="ev-share-name" maxlength="40" placeholder="Such as a partner name" autocomplete="off"></label></div>
+        ${row('Link for that place', shareUrl(e, 'partner', 'referral'), 'ev-share-custom')}
+        <p class="hint">Bookings made from these links show under Reports, Source.</p></div>`,
+      actions: [{ label: 'Done', kind: 'primary' }],
+      onOpen: (d) => {
+        d.querySelector('#ev-share-name').addEventListener('input', (ev) => { d.querySelector('#ev-share-custom').value = shareUrl(e, slug(ev.target.value) || 'partner', 'referral'); });
+        d.addEventListener('click', (ev) => {
+          const b = ev.target.closest('[data-copy]');
+          if (!b) return;
+          const box = d.querySelector(`#${b.dataset.copy}`);
+          const done = () => UI.toast('Link copied.');
+          if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(box.value).then(done, () => { box.select(); UI.toast('Press Ctrl+C to copy.'); });
+          else { box.select(); UI.toast('Press Ctrl+C to copy.'); }
+        });
+      }
     });
   }
 
@@ -226,6 +319,9 @@
     c.id = Core.nextId(s, 'e');
     c.title = `Copy of ${e.title}`;
     c.draft = true; c.cancelled = false; c.salesClosed = false; c.salesOpenAt = ''; c.salesCloseAt = '';
+    /* The copy has its own approval. Core.needsEventApproval lets it publish directly only if this event is live. */
+    c.copyOf = e.id;
+    delete c.approval;
     c.tickets.forEach((t) => { t.id = Core.nextId(s, 'tt'); t.salesEnd = ''; });
     /* Keeps how many sessions there are and their limits. The dates are left empty for staff to set. */
     c.sessions = Core.sortedSessions(e).filter((x) => !x.cancelled).map((x) => ({ id: Core.nextId(s, 's'), start: '', durationMin: x.durationMin, capacity: x.capacity, cancelled: false }));
@@ -235,30 +331,92 @@
     UI.toast('Copied as a Draft. Add the dates before you publish.');
     App.go(`#/events/${encodeURIComponent(c.id)}${window.EventForm ? '/edit' : ''}`);
   }
-  function publish(e) {
-    if (!allowed('events.edit', e)) return;
-    const now = App.now(), live = e.sessions.filter((x) => !x.cancelled), blockers = [];
+  function publishBlockers(e, now) {
+    const live = e.sessions.filter((x) => !x.cancelled), blockers = [];
     if (!String(e.title || '').trim()) blockers.push('Add a title.');
     if (!e.tickets.length) blockers.push('Add at least one ticket price.');
     if (!live.length) blockers.push('Add at least one session.');
     const noDate = live.filter((x) => !x.start).length;
     if (noDate) blockers.push(`${plural(noDate, 'session has', 'sessions have')} no date yet.`);
     if (live.length && noDate < live.length && !live.some((x) => isFuture(x, now))) blockers.push('Every session has already passed.');
+    return blockers;
+  }
+  const blockersHtml = (blockers) => `<p>This event cannot go on sale yet:</p><ul class="ev-list">${blockers.map((b) => `<li>${esc(b)}</li>`).join('')}</ul>`;
+  const onSaleText = (e, now) => (e.salesOpenAt && new Date(e.salesOpenAt) > now ? `This event will be Scheduled. Sales open on ${UI.dateTime(e.salesOpenAt)}.` : 'This event will go On sale now.');
+  const priceWarningsHtml = (warnings) => (warnings.length ? `<div class="ev-warn"><b>Check these prices first</b><ul class="ev-list">${warnings.map((w) => `<li>${esc(w)}</li>`).join('')}</ul></div>` : '');
+  function publish(e) {
+    if (!allowed('events.edit', e)) return;
+    const now = App.now(), blockers = publishBlockers(e, now), asks = needsApproval(e);
+    if (!isAdmin() && window.EventForm && window.EventForm.floorIssues) blockers.push(...window.EventForm.floorIssues(e));
     const warnings = Core.pricingWarnings(e);
-    const opens = e.salesOpenAt && new Date(e.salesOpenAt) > now;
-    const body = blockers.length
-      ? `<p>This event cannot go on sale yet:</p><ul class="ev-list">${blockers.map((b) => `<li>${esc(b)}</li>`).join('')}</ul>`
-      : `<p>${opens ? esc(`This event will be Scheduled. Sales open on ${UI.dateTime(e.salesOpenAt)}.`) : 'This event will go On sale now.'}</p>
-         ${warnings.length ? `<div class="ev-warn"><b>Check these prices first</b><ul class="ev-list">${warnings.map((w) => `<li>${esc(w)}</li>`).join('')}</ul></div>` : ''}`;
-    const actions = blockers.length ? [{ label: 'Close', kind: 'ghost' }] : [{ label: 'Not yet', kind: 'ghost' }, { label: warnings.length ? 'Publish anyway' : 'Publish', kind: 'primary', onClick: () => {
+    const lead = asks ? '<p>Marketing checks new events from club managers. It will show as Pending approval, and customers cannot book it until marketing approves it.</p>' : `<p>${esc(onSaleText(e, now))}</p>`;
+    const body = blockers.length ? blockersHtml(blockers) : `${lead}${priceWarningsHtml(warnings)}`;
+    const actions = blockers.length ? [{ label: 'Close', kind: 'ghost' }] : [{ label: 'Not yet', kind: 'ghost' }, { label: asks ? 'Send for approval' : warnings.length ? 'Publish anyway' : 'Publish', kind: 'primary', onClick: () => {
       if (!allowed('events.edit', e)) return;
+      const at = App.now();
+      if (asks) {
+        /* It stays a draft underneath while it waits, so every booking screen and report leaves it out. */
+        e.draft = true;
+        e.approval = { status: 'pending', by: who(), at: Core.toLocalISO(at) };
+        Core.notice(S(), { at, by: who(), kind: 'event', text: `${e.title} at ${venueName(e.venueId)} is waiting for approval.` });
+        App.log('Event', `${e.title}: sent to marketing for approval.`);
+        App.save(); App.render();
+        UI.toast('Sent to marketing for approval.');
+        return;
+      }
       e.draft = false;
+      /* The marketing admin publishing an event that was rejected earlier also settles its approval. */
+      if (approvalOf(e) === 'rejected') e.approval = { status: 'approved', by: who(), at: Core.toLocalISO(at) };
       const status = Core.eventStatus(S(), e, App.now());
       App.log('Event', `${e.title}: published, now ${status}.${warnings.length ? ` Published with ${plural(warnings.length, 'price warning')}.` : ''}`);
       App.save(); App.render();
       UI.toast(`Published. This event is now ${status}.`);
     } }];
-    UI.dialog({ title: `Publish ${e.title}?`, body, actions });
+    UI.dialog({ title: asks ? `Send ${e.title} for approval?` : `Publish ${e.title}?`, body, actions });
+  }
+  /* ---------- Approval of new events from club managers ---------- */
+  function canDecide(e) {
+    if (!allowed('events.edit', e)) return false;
+    if (!isAdmin() || approvalOf(e) !== 'pending') { UI.toast('Only the marketing admin can decide this, and only while it is waiting.', 'bad'); return false; }
+    return true;
+  }
+  function approve(e) {
+    if (!canDecide(e)) return;
+    const now = App.now(), blockers = publishBlockers(e, now), warnings = Core.pricingWarnings(e), from = e.approval.by || 'A club manager';
+    const body = blockers.length
+      ? `${blockersHtml(blockers)}<p class="hint">Reject it with this reason so ${esc(from)} can fix it, or edit it yourself.</p>`
+      : `<p>${esc(from)} sent this event for approval. ${esc(onSaleText(e, now))}</p>${priceWarningsHtml(warnings)}`;
+    UI.dialog({
+      title: `Approve ${e.title}?`, body,
+      actions: blockers.length ? [{ label: 'Close', kind: 'ghost' }] : [{ label: 'Not yet', kind: 'ghost' }, { label: warnings.length ? 'Approve anyway' : 'Approve', kind: 'primary', onClick: () => {
+        if (!canDecide(e)) return;
+        const at = App.now();
+        e.approval = { status: 'approved', by: who(), at: Core.toLocalISO(at), requestedBy: e.approval.by };
+        e.draft = false;
+        const status = Core.eventStatus(S(), e, at);
+        App.log('Event', `${e.title}: approved, now ${status}. Sent by ${from}.`);
+        App.save(); App.render();
+        UI.toast(`Approved. This event is now ${status}.`);
+      } }]
+    });
+  }
+  function reject(e) {
+    if (!canDecide(e)) return;
+    UI.dialog({
+      title: `Reject ${e.title}?`, subtitle: 'It goes back to draft, and the club manager sees your reason.',
+      body: '<label class="field"><span>Reason (required)</span><textarea id="ev-reject-reason" rows="3" maxlength="300"></textarea></label>',
+      actions: [{ label: 'Keep waiting', kind: 'ghost' }, { label: 'Reject', kind: 'danger', onClick: (d) => {
+        const reason = d.querySelector('#ev-reject-reason').value.trim();
+        if (!reason) { UI.dialogError(d, 'Add a reason, so the club manager knows what to change.'); return false; }
+        if (!canDecide(e)) return undefined;
+        e.approval = { status: 'rejected', by: who(), at: Core.toLocalISO(App.now()), reason };
+        e.draft = true;
+        App.log('Event', `${e.title}: rejected, back to draft. Reason: ${reason}`);
+        App.save(); App.render();
+        UI.toast('Rejected. The event is back to draft.');
+        return undefined;
+      } }]
+    });
   }
   function closeSales(e) {
     if (!allowed('events.edit', e)) return;
@@ -346,7 +504,7 @@
     return `${plural(moved, 'booking')} will move and be told they can ask for a refund instead.${rest ? ` ${plural(rest, 'booking')} cannot move (no room, or already booked on that session), so they get a refund.` : ''}`;
   }
   function affectedTable(rows, block) {
-    return UI.table([
+    return UI.table({ title: 'Affected bookings', subtitle: 'The bookings this change touches.' }, [
       { label: 'Booking', html: (r) => esc(r.booking.ref) },
       { label: 'Customer', html: (r) => esc(r.booking.customer.name) },
       { label: 'People', html: (r) => esc(r.people) },
@@ -365,11 +523,11 @@
       : 'Only this session of their block is affected. Their other sessions stay booked.';
     const body = rows.length ? `
       <p class="hint">Step 1. Cancelling ${esc(flow.label)}.</p>
-      <div class="grid ev-stats">
-        <div class="stat"><b>${rows.length}</b><span>Bookings</span></div>
-        <div class="stat"><b>${peopleIn(rows)}</b><span>People</span></div>
-        <div class="stat"><b>${esc(UI.money(money))}</b><span>Money involved</span></div>
-        ${addOns ? `<div class="stat"><b>${esc(UI.money(addOns))}</b><span>Add-ons, for those with no place left</span></div>` : ''}
+      <div class="grid stats ev-stats">
+        <div class="stat">${UI.statIcon('ticket', UI.statTone(0))}<b>${rows.length}</b><span>Bookings</span></div>
+        <div class="stat">${UI.statIcon('users', UI.statTone(1))}<b>${peopleIn(rows)}</b><span>People</span></div>
+        <div class="stat">${UI.statIcon('wallet', UI.statTone(2))}<b>${esc(UI.money(money))}</b><span>Money involved</span></div>
+        ${addOns ? `<div class="stat">${UI.statIcon('seat', UI.statTone(3))}<b>${esc(UI.money(addOns))}</b><span>Add-ons, for those with no place left</span></div>` : ''}
       </div>
       ${waiting ? `<p>${esc(plural(waiting, 'person', 'people'))} on the waitlist will be taken off it.</p>` : ''}
       <h3>Single bookings (${singles.length})</h3>${singles.length ? affectedTable(singles, false) : '<p class="muted">None.</p>'}
@@ -416,7 +574,7 @@
     const read = (d) => d.querySelectorAll('select[data-b]').forEach((c) => { flow.decisions[c.dataset.b] = c.value; });
     UI.dialog({
       title: 'Decide for each booking', wide: true,
-      body: `<p class="hint">Step 2.</p>${UI.table([
+      body: `<p class="hint">Step 2.</p>${UI.table({ title: 'Decide for each booking', subtitle: 'Choose what happens to every affected booking.' }, [
         { label: 'Booking', html: (r) => `${esc(r.booking.ref)}${r.booking.kind === 'block' ? ' <span class="hint">(block)</span>' : ''}` },
         { label: 'Customer', html: (r) => esc(r.booking.customer.name) },
         { label: 'Places', html: (r) => esc(r.tickets.length) },
@@ -470,7 +628,8 @@
       ${count('transfer') ? `<li>${esc(plural(count('transfer'), 'booking'))} moved to another session</li>` : ''}
       ${count('none') ? `<li>${esc(plural(count('none'), 'booking'))} cancelled with no refund</li>` : ''}</ul>` : '';
     const body = `<div class="ev-form"><p class="hint">Step ${flow.choice === "decide" ? 3 : 2}. Cancelling ${esc(flow.label)}.</p>${summary}
-      <label class="field"><span>Reason (kept in the activity log and on each booking)</span><input type="text" id="ev-reason" value="${esc(flow.reason)}" maxlength="200"></label>
+      <label class="field"><span>Reason (required, kept in the activity log and on each booking)</span><input type="text" id="ev-reason" value="${esc(flow.reason)}" maxlength="200"></label>
+      ${flow.whole && App.role() === 'manager' ? '<p class="hint">Marketing gets a notice with this reason.</p>' : ''}
       ${items.length ? `<label class="field"><span>Extra words for the customer message (optional)</span><textarea id="ev-extra" rows="2">${esc(flow.extra)}</textarea></label>
       <h3>Customer message</h3><div id="ev-previews"></div>
       ${UI.demo('No real money moves and no real emails are sent. A live system would call the payment provider and send these messages.')}` : ''}</div>`;
@@ -534,6 +693,7 @@
     });
     const count = (a) => items.filter((i) => i.action === a).length;
     App.log('Cancel', `${e.title}: cancelled ${flow.label}. ${plural(items.length, 'booking')} affected: ${count('refund')} refunded (${UI.money(result.refunded + addOnRefunded)}), ${count('transfer')} moved, ${count('none')} with no refund. Reason: ${reason}`);
+    if (e.cancelled && App.role() === 'manager') Core.notice(s, { at: now, by, kind: 'cancel', text: `${e.title} at ${venueName(e.venueId)}: whole event cancelled, ${plural(items.length, 'booking')} affected. Reason: ${reason}` });
     App.save();
     App.render();
     showProgress(flow, steps, waitlisted);
@@ -674,6 +834,92 @@
     });
   }
 
+  /* ---------- Message attendees of one session (simulated) ---------- */
+  /* Text in [square brackets] must be replaced before sending. */
+  const MESSAGE_TEMPLATES = [
+    { key: 'moved', label: 'Session moved', subject: 'New time for {event}',
+      body: 'Hello,\n\nThe {event} session on {date} at {venue} has moved to [new date and time].\n\nYour place is safe. If the new time does not suit you, reply to this email and we will help.',
+      note: 'This only sends a message. To change the time itself, use Edit on the session.' },
+    { key: 'cancelled', label: 'Session cancelled', subject: '{event} on {date} is cancelled',
+      body: 'Hello,\n\nWe are sorry, but the {event} session on {date} at {venue} is cancelled.\n\n[What happens next, such as a refund or another date.]',
+      note: 'This only sends a message. It does not cancel the session or refund anyone. To do that, use Cancel on the session.' },
+    { key: 'coach', label: 'Coach unavailable', subject: 'Coach update for {event} on {date}',
+      body: 'Hello,\n\nThe coach for the {event} session on {date} at {venue} cannot be there.\n\n[What happens instead, such as a new coach.]',
+      note: '' },
+    { key: 'custom', label: 'Custom', subject: '', body: '', note: 'Use this for changes to the session only, not for offers. These go to everyone booked, whatever they chose about marketing.' }
+  ];
+  /* The built-in choices, then the templates marketing added on the Messages page, then Custom. */
+  const messageTemplates = () => {
+    const mine = (S().emailTemplates || []).filter((t) => t.custom).map((t) => ({ key: t.id, label: t.name, subject: t.subject, body: t.body, note: 'Use this for changes to the session only, not for offers. These go to everyone booked, whatever they chose about marketing.' }));
+    return MESSAGE_TEMPLATES.slice(0, -1).concat(mine, MESSAGE_TEMPLATES.slice(-1));
+  };
+  /* The lead booker of each booking, and any guest on this session with an email saved. */
+  function messageRecipients(rows) {
+    const emails = new Set();
+    const add = (v) => { const t = String(v || '').trim().toLowerCase(); if (t) emails.add(t); };
+    rows.forEach((r) => {
+      add(r.booking.customer && r.booking.customer.email);
+      r.tickets.forEach((t) => { const p = (r.booking.people || []).find((x) => x.id === t.personId); if (p) add(p.email); });
+    });
+    return emails.size;
+  }
+  function messageAttendees(e, sessionId) {
+    if (!allowed('events.edit', e)) return;
+    const x = e.sessions.find((y) => y.id === sessionId);
+    if (!x) return;
+    const rows = Core.affected(S(), [sessionId]), people = messageRecipients(rows), label = sessionLabel(x);
+    const fill = (t) => t.replace(/\{\{?event\}?\}/g, () => e.title).replace(/\{\{?date\}?\}/g, () => label).replace(/\{\{?venue\}?\}/g, () => venueName(e.venueId));
+    const count = rows.length
+      ? `<b>${esc(plural(people, 'person', 'people'))}</b> in ${esc(plural(rows.length, 'booking'))} will get this message.`
+      : 'Nobody is booked on this session, so there is nobody to message.';
+    const body = `<div class="ev-form">
+      <div class="ev-note" role="status">${count}</div>
+      ${rows.length ? `<label class="field"><span>Template</span><select id="ev-msg-tpl">${UI.options(messageTemplates().map((t) => ({ value: t.key, label: t.label })), MESSAGE_TEMPLATES[0].key)}</select></label>
+      <p class="hint" id="ev-msg-note"></p>
+      <label class="field"><span>Subject</span><input type="text" id="ev-msg-subject" maxlength="150" autocomplete="off"></label>
+      <label class="field"><span>Message</span><textarea id="ev-msg-body" rows="8"></textarea></label>
+      ${UI.demo('No real emails are sent. A live system would send this to each person through Klaviyo.')}` : ''}</div>`;
+    const send = (d) => {
+      if (!allowed('events.edit', e)) return undefined;
+      const subject = d.querySelector('#ev-msg-subject').value.trim(), text = d.querySelector('#ev-msg-body').value.trim();
+      if (!subject || !text) { UI.dialogError(d, 'Add a subject and a message.'); return false; }
+      if (/\[[^\]]*\]/.test(`${subject} ${text}`)) { UI.dialogError(d, 'Replace the words in [square brackets] first.'); return false; }
+      /* These are filled in for each person. Anything else has no value when messaging a whole session. */
+      const stuck = (`${subject} ${text}`.match(/\{\{[^}]*\}\}/g) || []).find((x) => !['{{first_name}}', '{{ref}}'].includes(x));
+      if (stuck) { UI.dialogError(d, `${stuck} cannot be filled in when messaging a whole session. Replace it with the real words.`); return false; }
+      const s = S(), now = App.now(), by = who();
+      /* Read again, in case bookings changed while the dialog was open. */
+      const current = Core.affected(s, [sessionId]), sent = messageRecipients(current);
+      if (!current.length) { UI.dialogError(d, 'Nobody is booked on this session now.'); return false; }
+      current.forEach((r) => {
+        Core.klaviyo(s, { at: now, type: 'Attendee message', ref: r.booking.ref });
+        Core.logBooking(r.booking, now, by, `Message to attendees of ${label}: "${subject}" (demo, not really sent).`);
+      });
+      App.log('Message', `${e.title}, ${label}: "${subject}" sent to ${plural(sent, 'person', 'people')} in ${plural(current.length, 'booking')} (demo).`);
+      App.save(); App.render();
+      UI.toast(`Message sent to ${plural(sent, 'person', 'people')} (demo).`);
+      return undefined;
+    };
+    UI.dialog({
+      title: 'Message attendees', subtitle: `${e.title}, ${label}`, wide: true, body,
+      actions: rows.length ? [{ label: 'Cancel', kind: 'ghost' }, { label: `Send to ${plural(people, 'person', 'people')}`, kind: 'primary', onClick: (d) => send(d) }] : [{ label: 'Close', kind: 'ghost' }],
+      onOpen: (d) => {
+        const pick = d.querySelector('#ev-msg-tpl');
+        if (!pick) return;
+        const draw = () => {
+          const t = messageTemplates().find((y) => y.key === pick.value);
+          d.querySelector('#ev-msg-subject').value = fill(t.subject);
+          d.querySelector('#ev-msg-body').value = fill(t.body);
+          d.querySelector('#ev-msg-note').textContent = t.note;
+          d.querySelector('#ev-msg-note').hidden = !t.note;
+          UI.dialogError(d, '');
+        };
+        pick.addEventListener('change', draw);
+        draw();
+      }
+    });
+  }
+
   /* ---------- Waitlist ---------- */
   function offerState(w, now) {
     if (w.status !== 'Offered') return 'Waiting';
@@ -713,6 +959,7 @@
             bits.push(`<button type="button" class="btn btn-small" data-w="up" data-id="${esc(w.id)}" aria-label="Move ${name} up"${p === 1 ? ' disabled' : ''}>Up</button>`);
             bits.push(`<button type="button" class="btn btn-small" data-w="down" data-id="${esc(w.id)}" aria-label="Move ${name} down"${p === waiting.length ? ' disabled' : ''}>Down</button>`);
           } else {
+            if (st === 'Offered') bits.push(`<button type="button" class="btn btn-small" data-w="claimed" data-id="${esc(w.id)}" aria-label="${name} took the place">Mark as booked</button>`);
             bits.push(`<button type="button" class="btn btn-small" data-w="requeue" data-id="${esc(w.id)}" aria-label="Put ${name} back in the queue">${st === 'Offered' ? 'Take back offer' : 'Back in queue'}</button>`);
           }
           bits.push(`<button type="button" class="btn btn-small" data-w="remove" data-id="${esc(w.id)}" aria-label="Remove ${name}">Remove</button>`);
@@ -720,9 +967,10 @@
         } });
       }
       box.innerHTML = `<p>${esc(plural(left, 'space'))} left. ${held ? `${esc(plural(held, 'place'))} held by offers. ` : ''}${esc(plural(free, 'place'))} free to offer. An offer lasts ${esc(hours)} hours.</p>
-        ${UI.table(cols, list, { emptyText: 'Nobody is on the waitlist for this session.' })}
+        ${UI.table({ title: 'Waitlist', subtitle: 'People waiting for a place on this session, in order.' }, cols, list, { emptyText: 'Nobody is on the waitlist for this session.' })}
+        ${canManage() ? `<label class="check ev-auto"><input type="checkbox" data-w-auto${found.autoOffer !== false ? ' checked' : ''}> <span>Offer freed places automatically<span class="hint">When a place opens, the next person gets an offer without anyone pressing Notify.</span></span></label>` : ''}
         ${canManage() ? `<div class="ev-notify"><button type="button" class="btn btn-primary" data-w="notify"${why ? ' disabled' : ''}>Notify next person</button>${why ? `<p class="hint">${esc(why)}</p>` : ''}</div>
-        ${UI.demo('No real email is sent. A live system would send the offer with a time-limited link. The place is not held from other buyers in this demo.')}` : ''}`;
+        ${UI.demo('No real email is sent. A live system would send the offer with a time-limited link. The place is held from other online buyers, but staff can still book it.')}` : ''}`;
       if (focusSel) { const first = focusSel.map((q) => box.querySelector(q)).find((b) => b && !b.disabled); (first || box).focus(); }
     };
     const act = (b) => {
@@ -746,6 +994,11 @@
         next.offerUntil = Core.toLocalISO(new Date(now.getTime() + s.settings.waitlistClaimHours * 3600000));
         App.log('Waitlist', `${e.title}, ${sessionLabel(found)}: ${next.name} offered a place until ${UI.dateTime(next.offerUntil)} (demo).`);
         UI.toast(`Offer sent to ${next.name} (demo).`);
+      } else if (kind === 'claimed') {
+        /* Counted in Reports as a place recovered from the waitlist. */
+        w.status = 'Booked'; w.claimedAt = Core.toLocalISO(now);
+        App.log('Waitlist', `${e.title}, ${sessionLabel(found)}: ${w.name} took the offered place.`);
+        UI.toast(`${w.name} marked as booked. Add their booking from Bookings.`);
       } else if (kind === 'requeue') {
         w.status = 'Waiting'; w.offerUntil = '';
         App.log('Waitlist', `${e.title}, ${sessionLabel(found)}: ${w.name} put back in the queue.`);
@@ -762,6 +1015,14 @@
         box = d.querySelector('.ev-waitlist');
         box.tabIndex = -1;
         box.addEventListener('click', (ev) => { const b = ev.target.closest('button[data-w]'); if (b) act(b); });
+        box.addEventListener('change', (ev) => {
+          if (!ev.target.matches('[data-w-auto]') || !allowed('events.edit', e)) return;
+          found.autoOffer = ev.target.checked;
+          App.log('Waitlist', `${e.title}, ${sessionLabel(found)}: automatic offers turned ${found.autoOffer ? 'on' : 'off'}.`);
+          const made = found.autoOffer ? Core.runAutoOffers(S(), App.now()) : 0;
+          if (made) UI.toast(`${plural(made, 'offer')} sent (demo).`);
+          App.save(); App.render(); draw(['[data-w-auto]']);
+        });
         draw();
       }
     });
@@ -773,8 +1034,10 @@
     if (!App.can('events.edit') || (id && e && !Core.canSeeVenue(App.user(), e.venueId))) { main.innerHTML = UI.empty('Your role cannot do this.'); return; }
     if (id && !e) { main.innerHTML = UI.empty('We could not find this event.'); return; }
     if (e && e.cancelled) { main.innerHTML = UI.empty('This event is cancelled, so it cannot be edited.'); return; }
-    if (window.EventForm && window.EventForm.render) { window.EventForm.render(main, id); return; }
-    main.innerHTML = UI.empty('The event form is not available yet.');
+    if (!(window.EventForm && window.EventForm.render)) { main.innerHTML = UI.empty('The event form is not available yet.'); return; }
+    /* The form opens in a modal over the list. */
+    renderList(main);
+    window.EventForm.render(App.modal({ title: e ? `Edit: ${e.title}` : 'New event', subtitle: !e && window.EventForm.isQuick && window.EventForm.isQuick(null) ? 'Fill in the basics to get it on sale. You can add more detail any time.' : 'Set up an event in six steps. You can save a draft at any point.', icon: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M4 6h16v14H4zM4 10h16M8 3v4M16 3v4"/></svg>', back: '#/events' }), id);
   }
   App.route('events', {
     title: 'Events', perm: 'events.view',

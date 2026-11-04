@@ -1,0 +1,6 @@
+/* My club page only. Every selector starts with a club- class. */
+.club-dl{display:grid;grid-template-columns:minmax(100px,140px) minmax(0,1fr);gap:6px 14px;margin:0}
+.club-dl dt{font-weight:700;font-size:13px}
+.club-dl dd{margin:0;overflow-wrap:anywhere}
+.club-dialog textarea{width:100%}
+@media (max-width:760px){.club-dl{grid-template-columns:minmax(0,1fr);gap:2px}.club-dl dd{margin-bottom:8px}}
